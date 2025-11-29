@@ -5,59 +5,43 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 import sys
 import os
+import argparse
+import math
+import wandb
+from pathlib import Path
+
 # Add path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'extension-cpp'))  # Add this line
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'extension-cpp'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'ai-modules'))
 from wavesAI.model.aussm import SSMSeq2Seq
-# Add path for imports
-# sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'ai-modules'))
-# from wavesAI.model.aussm import SSMSeq2Seq
 
-# Configuration
-BATCH_SIZE = 8
-SEQ_LENGTH = 512
-LEARNING_RATE = 1e-4
-NUM_EPOCHS = 3
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Load WikiText-2 dataset
-print("Loading WikiText dataset...")
-dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+def count_layers(layer_string):
+    """Count AUSSM and Mamba layers in the layer configuration string."""
+    layers = layer_string.replace(" ", "").split("|")
+    num_aussm = sum(1 for l in layers if l == "a")
+    num_mamba = sum(1 for l in layers if l == "m")
+    return num_aussm, num_mamba, len(layers)
 
-# Load tokenizer
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
 
-vocab_size = len(tokenizer)
-print("vocab_size: ", vocab_size) 
-# exit()
+def calculate_perplexity(loss):
+    """Calculate perplexity from cross-entropy loss."""
+    return math.exp(loss)
 
-# Tokenize dataset
-def tokenize_function(examples):
+
+def tokenize_function(examples, tokenizer, seq_length):
+    """Tokenize examples for language modeling."""
     return tokenizer(
         examples["text"],
         truncation=True,
-        max_length=SEQ_LENGTH + 1,  # +1 for shift
+        max_length=seq_length + 1,  # +1 for shift
         padding="max_length",
         return_tensors="pt"
     )
 
-print("Tokenizing dataset...")
-tokenized_train = dataset["train"].map(
-    tokenize_function,
-    batched=True,
-    remove_columns=dataset["train"].column_names
-)
-tokenized_val = dataset["validation"].map(
-    tokenize_function,
-    batched=True,
-    remove_columns=dataset["validation"].column_names
-)
 
-# Create dataset class
 class WikiTextDataset(Dataset):
+    """Dataset class for WikiText language modeling."""
     def __init__(self, tokenized_data):
         self.data = tokenized_data
         
@@ -69,46 +53,16 @@ class WikiTextDataset(Dataset):
         # For language modeling: input is tokens[:-1], target is tokens[1:]
         return input_ids[:-1], input_ids[1:]
 
-# Create data loaders
-train_dataset = WikiTextDataset(tokenized_train)
-val_dataset = WikiTextDataset(tokenized_val)
 
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=2
-)
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=False,
-    num_workers=2
-)
-# Initialize model
-print("Initializing model...")
-model = SSMSeq2Seq(
-    d_model=512,
-    vocab_size=vocab_size,
-    output_vocab_size=vocab_size,
-    layers="m|m|a",
-    d_state=16,
-    verbose=True
-).to(DEVICE)
-
-# Loss and optimizer
-criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
-optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-# Training loop
-print("Starting training...")
-for epoch in range(NUM_EPOCHS):
+def train_epoch(model, train_loader, criterion, optimizer, device, vocab_size, log_interval=100):
+    """Train for one epoch."""
     model.train()
     total_loss = 0
     num_batches = 0
     
     for batch_idx, (inputs, targets) in enumerate(train_loader):
-        inputs = inputs.to(DEVICE)
-        targets = targets.to(DEVICE)
+        inputs = inputs.to(device)
+        targets = targets.to(device)
         
         # Forward pass
         logits = model(inputs)  # (batch, seq_len, vocab_size)
@@ -124,20 +78,31 @@ for epoch in range(NUM_EPOCHS):
         total_loss += loss.item()
         num_batches += 1
         
-        if batch_idx % 100 == 0:
-            print(f"Epoch {epoch+1}/{NUM_EPOCHS}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+        if batch_idx % log_interval == 0:
+            perplexity = calculate_perplexity(loss.item())
+            print(f"Batch {batch_idx}, Loss: {loss.item():.4f}, Perplexity: {perplexity:.2f}")
+            if wandb.run is not None:
+                wandb.log({
+                    "train/batch_loss": loss.item(),
+                    "train/batch_perplexity": perplexity,
+                    "train/batch": batch_idx
+                })
     
     avg_loss = total_loss / num_batches
-    print(f"Epoch {epoch+1} completed. Average Loss: {avg_loss:.4f}")
-    
-    # Validation
+    avg_perplexity = calculate_perplexity(avg_loss)
+    return avg_loss, avg_perplexity
+
+
+def validate(model, val_loader, criterion, device, vocab_size):
+    """Validate the model."""
     model.eval()
     val_loss = 0
     val_batches = 0
+    
     with torch.no_grad():
         for inputs, targets in val_loader:
-            inputs = inputs.to(DEVICE)
-            targets = targets.to(DEVICE)
+            inputs = inputs.to(device)
+            targets = targets.to(device)
             
             logits = model(inputs)
             loss = criterion(logits.reshape(-1, vocab_size), targets.reshape(-1))
@@ -146,6 +111,214 @@ for epoch in range(NUM_EPOCHS):
             val_batches += 1
     
     avg_val_loss = val_loss / val_batches
-    print(f"Validation Loss: {avg_val_loss:.4f}\n")
+    avg_val_perplexity = calculate_perplexity(avg_val_loss)
+    return avg_val_loss, avg_val_perplexity
 
-print("Training completed!")
+
+def main():
+    parser = argparse.ArgumentParser(description='Train AUSSM/Mamba language model on WikiText-2')
+    
+    # Model arguments
+    parser.add_argument('--layers', type=str, default='m|m|a',
+                       help='Layer configuration string (e.g., "m|m|a" for Mamba-Mamba-AUSSM)')
+    parser.add_argument('--d_model', type=int, default=512,
+                       help='Model dimension')
+    parser.add_argument('--d_state', type=int, default=16,
+                       help='SSM state dimension')
+    parser.add_argument('--mamba_expand', type=int, default=2,
+                       help='Mamba expansion factor')
+    
+    # Training arguments
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help='Batch size')
+    parser.add_argument('--seq_length', type=int, default=512,
+                       help='Sequence length')
+    parser.add_argument('--learning_rate', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.01,
+                       help='Weight decay')
+    parser.add_argument('--num_epochs', type=int, default=3,
+                       help='Number of epochs')
+    parser.add_argument('--num_workers', type=int, default=2,
+                       help='Number of data loader workers')
+    parser.add_argument('--log_interval', type=int, default=100,
+                       help='Logging interval in batches')
+    
+    # Wandb arguments
+    parser.add_argument('--wandb_project', type=str, default='aussm-lm',
+                       help='Wandb project name')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                       help='Wandb entity/team name')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                       help='Wandb run name (auto-generated if not provided)')
+    parser.add_argument('--wandb_group', type=str, default=None,
+                       help='Wandb group name for organizing runs')
+    parser.add_argument('--no_wandb', action='store_true',
+                       help='Disable wandb logging')
+    
+    # Other arguments
+    parser.add_argument('--device', type=str, default=None,
+                       help='Device to use (cuda/cpu, auto-detected if not provided)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed')
+    
+    args = parser.parse_args()
+    
+    # Set device
+    if args.device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    else:
+        device = args.device
+    
+    # Set random seed
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # Count layers
+    num_aussm, num_mamba, total_layers = count_layers(args.layers)
+    
+    # Initialize wandb
+    if not args.no_wandb:
+        run_name = args.wandb_run_name
+        if run_name is None:
+            run_name = f"layers_{args.layers}_d{args.d_model}_s{args.d_state}_lr{args.learning_rate}"
+        
+        wandb_kwargs = {
+            'project': args.wandb_project,
+            'name': run_name,
+            'config': {
+                "layers": args.layers,
+                "num_aussm_layers": num_aussm,
+                "num_mamba_layers": num_mamba,
+                "total_layers": total_layers,
+                "d_model": args.d_model,
+                "d_state": args.d_state,
+                "mamba_expand": args.mamba_expand,
+                "batch_size": args.batch_size,
+                "seq_length": args.seq_length,
+                "learning_rate": args.learning_rate,
+                "weight_decay": args.weight_decay,
+                "num_epochs": args.num_epochs,
+                "seed": args.seed,
+            }
+        }
+        if args.wandb_entity:
+            wandb_kwargs['entity'] = args.wandb_entity
+        if args.wandb_group:
+            wandb_kwargs['group'] = args.wandb_group
+        
+        wandb.init(**wandb_kwargs)
+    
+    # Load dataset
+    print("Loading WikiText dataset...")
+    dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+    
+    # Load tokenizer
+    print("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    vocab_size = len(tokenizer)
+    print(f"Vocabulary size: {vocab_size}")
+    
+    # Tokenize dataset
+    print("Tokenizing dataset...")
+    tokenize_fn = lambda examples: tokenize_function(examples, tokenizer, args.seq_length)
+    tokenized_train = dataset["train"].map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=dataset["train"].column_names
+    )
+    tokenized_val = dataset["validation"].map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=dataset["validation"].column_names
+    )
+    
+    # Create data loaders
+    train_dataset = WikiTextDataset(tokenized_train)
+    val_dataset = WikiTextDataset(tokenized_val)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers
+    )
+    
+    # Initialize model
+    print(f"Initializing model with layers: {args.layers}")
+    print(f"  - AUSSM layers: {num_aussm}")
+    print(f"  - Mamba layers: {num_mamba}")
+    print(f"  - Total layers: {total_layers}")
+    
+    model = SSMSeq2Seq(
+        d_model=args.d_model,
+        vocab_size=vocab_size,
+        output_vocab_size=vocab_size,
+        layers=args.layers,
+        d_state=args.d_state,
+        mamba_expand=args.mamba_expand,
+        verbose=True
+    ).to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    if wandb.run is not None:
+        wandb.config.update({
+            "total_params": total_params,
+            "trainable_params": trainable_params
+        })
+    
+    # Loss and optimizer
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay
+    )
+    
+    # Training loop
+    print("Starting training...")
+    for epoch in range(args.num_epochs):
+        print(f"\nEpoch {epoch+1}/{args.num_epochs}")
+        
+        # Train
+        train_loss, train_perplexity = train_epoch(
+            model, train_loader, criterion, optimizer, device, vocab_size, args.log_interval
+        )
+        print(f"Train Loss: {train_loss:.4f}, Train Perplexity: {train_perplexity:.2f}")
+        
+        # Validate
+        val_loss, val_perplexity = validate(model, val_loader, criterion, device, vocab_size)
+        print(f"Val Loss: {val_loss:.4f}, Val Perplexity: {val_perplexity:.2f}")
+        
+        # Log to wandb
+        if wandb.run is not None:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": train_loss,
+                "train/perplexity": train_perplexity,
+                "val/loss": val_loss,
+                "val/perplexity": val_perplexity,
+            })
+    
+    print("\nTraining completed!")
+    if wandb.run is not None:
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+{
+  "total_layers": 3,
+  "min_aussm": 0,
+  "max_aussm": 3,
+  "d_models": [512],
+  "d_states": [32, 64],
+  "mamba_expands": [2],
+  "batch_sizes": [8],
+  "learning_rates": [1e-4, 5e-4],
+  "weight_decays": [0.01],
+  "seq_lengths": [512],
+  "num_epochs": 3,
+  "seeds": [42, 43, 44],
+  "wandb_project": "aussm-lm",
+  "wandb_entity": null,
+  "wandb_group": "layer_comparison",
+  "mode": "local",
+  "max_parallel": 2
+}
+
