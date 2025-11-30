@@ -145,9 +145,9 @@ def main():
                        help='Logging interval in batches')
     
     # Wandb arguments
-    parser.add_argument('--wandb_project', type=str, default='aussm-lm',
+    parser.add_argument('--wandb_project', type=str, default='aussm-language-modeling',
                        help='Wandb project name')
-    parser.add_argument('--wandb_entity', type=str, default=None,
+    parser.add_argument('--wandb_entity', type=str, default='khavarib',
                        help='Wandb entity/team name')
     parser.add_argument('--wandb_run_name', type=str, default=None,
                        help='Wandb run name (auto-generated if not provided)')
@@ -155,6 +155,11 @@ def main():
                        help='Wandb group name for organizing runs')
     parser.add_argument('--no_wandb', action='store_true',
                        help='Disable wandb logging')
+    
+    # Dataset arguments
+    parser.add_argument('--dataset', type=str, default='wikitext',
+                       choices=['wikitext', 'ptb', 'tinystories', 'simplebooks'],
+                       help='Dataset to use: wikitext, ptb (Penn Treebank), tinystories, or simplebooks')
     
     # Other arguments
     parser.add_argument('--device', type=str, default=None,
@@ -188,6 +193,7 @@ def main():
             'project': args.wandb_project,
             'name': run_name,
             'config': {
+                "dataset": args.dataset,
                 "layers": args.layers,
                 "num_aussm_layers": num_aussm,
                 "num_mamba_layers": num_mamba,
@@ -210,9 +216,24 @@ def main():
         
         wandb.init(**wandb_kwargs)
     
-    # Load dataset
-    print("Loading WikiText dataset...")
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+    # Load dataset based on choice
+    print(f"Loading {args.dataset} dataset...")
+    if args.dataset == 'wikitext':
+        dataset = load_dataset("wikitext", "wikitext-2-raw-v1")
+    elif args.dataset == 'ptb':
+        dataset = load_dataset("ptb_text_only")
+        # PTB uses 'sentence' column instead of 'text'
+        if 'sentence' in dataset['train'].column_names:
+            dataset = dataset.rename_column('sentence', 'text')
+    elif args.dataset == 'tinystories':
+        # TinyStories dataset - very small and simple
+        dataset = load_dataset("roneneldan/TinyStories")
+        # TinyStories uses 'text' column
+    elif args.dataset == 'simplebooks':
+        # SimpleBooks dataset - simplified books
+        dataset = load_dataset("simplebooks")
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
     
     # Load tokenizer
     print("Loading tokenizer...")

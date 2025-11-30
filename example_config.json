@@ -11,8 +11,8 @@
   "seq_lengths": [512],
   "num_epochs": 3,
   "seeds": [42, 43, 44],
-  "wandb_project": "aussm-lm",
-  "wandb_entity": null,
+  "wandb_project": "aussm-language-modeling",
+  "wandb_entity": "khavarib",
   "wandb_group": "layer_comparison",
   "mode": "local",
   "max_parallel": 2

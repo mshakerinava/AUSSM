@@ -138,9 +138,9 @@ def main():
                        help='Random seeds to run')
     
     # Wandb settings
-    parser.add_argument('--wandb_project', type=str, default='aussm-lm',
+    parser.add_argument('--wandb_project', type=str, default='aussm-language-modeling',
                        help='Wandb project name')
-    parser.add_argument('--wandb_entity', type=str, default=None,
+    parser.add_argument('--wandb_entity', type=str, default='khavarib',
                        help='Wandb entity/team name')
     parser.add_argument('--wandb_group', type=str, default=None,
                        help='Wandb group name for organizing runs')

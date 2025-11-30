@@ -13,7 +13,8 @@ python3 run_experiments.py \
   --batch_sizes 8 \
   --num_epochs 1 \
   --seeds 42 \
-  --wandb_project "aussm-lm-test" \
+  --wandb_entity "khavarib" \
+  --wandb_project "aussm-language-modeling" \
   --wandb_group "quick_test" \
   --max_parallel 1
 
