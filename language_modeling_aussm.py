@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer
+from transformers import get_cosine_schedule_with_warmup
 import sys
 import os
 import argparse
@@ -27,6 +28,27 @@ def count_layers(layer_string):
 def calculate_perplexity(loss):
     """Calculate perplexity from cross-entropy loss."""
     return math.exp(loss)
+
+
+def get_weight_norm(model):
+    """Calculate the L2 norm of all model parameters."""
+    total_norm = 0.0
+    for param in model.parameters():
+        param_norm = param.data.norm(2)
+        total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** (1. / 2)
+    return total_norm
+
+
+def get_grad_norm(model):
+    """Calculate the L2 norm of all model gradients."""
+    total_norm = 0.0
+    for param in model.parameters():
+        if param.grad is not None:
+            param_norm = param.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** (1. / 2)
+    return total_norm
 
 
 def tokenize_function(examples, tokenizer, seq_length):
@@ -54,7 +76,7 @@ class WikiTextDataset(Dataset):
         return input_ids[:-1], input_ids[1:]
 
 
-def train_epoch(model, train_loader, criterion, optimizer, device, vocab_size, log_interval=100):
+def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, vocab_size, global_step, max_grad_norm=1.0, log_interval=100):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -73,24 +95,50 @@ def train_epoch(model, train_loader, criterion, optimizer, device, vocab_size, l
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
+        
+        # Calculate gradient norm before clipping
+        grad_norm = get_grad_norm(model)
+        
+        # Gradient clipping
+        if max_grad_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            grad_norm_clipped = get_grad_norm(model)
+        else:
+            grad_norm_clipped = grad_norm
+        
         optimizer.step()
+        
+        # Step scheduler if provided
+        if scheduler is not None:
+            scheduler.step()
+        
+        # Calculate weight norm and current learning rate
+        weight_norm = get_weight_norm(model)
+        current_lr = optimizer.param_groups[0]['lr']
         
         total_loss += loss.item()
         num_batches += 1
         
         if batch_idx % log_interval == 0:
             perplexity = calculate_perplexity(loss.item())
-            print(f"Batch {batch_idx}, Loss: {loss.item():.4f}, Perplexity: {perplexity:.2f}")
+            print(f"Batch {batch_idx}, Loss: {loss.item():.4f}, Perplexity: {perplexity:.2f}, LR: {current_lr:.2e}")
             if wandb.run is not None:
                 wandb.log({
                     "train/batch_loss": loss.item(),
                     "train/batch_perplexity": perplexity,
-                    "train/batch": batch_idx
+                    "train/batch": batch_idx,
+                    "train/weight_norm": weight_norm,
+                    "train/grad_norm": grad_norm,
+                    "train/grad_norm_clipped": grad_norm_clipped,
+                    "train/learning_rate": current_lr,
+                    "global_step": global_step
                 })
+        
+        global_step += 1
     
     avg_loss = total_loss / num_batches
     avg_perplexity = calculate_perplexity(avg_loss)
-    return avg_loss, avg_perplexity
+    return avg_loss, avg_perplexity, global_step
 
 
 def validate(model, val_loader, criterion, device, vocab_size):
@@ -139,6 +187,10 @@ def main():
                        help='Weight decay')
     parser.add_argument('--num_epochs', type=int, default=3,
                        help='Number of epochs')
+    parser.add_argument('--warmup_steps', type=int, default=1000,
+                       help='Number of warmup steps for learning rate scheduler')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0,
+                       help='Maximum gradient norm for clipping (0.0 to disable)')
     parser.add_argument('--num_workers', type=int, default=2,
                        help='Number of data loader workers')
     parser.add_argument('--log_interval', type=int, default=100,
@@ -206,6 +258,8 @@ def main():
                 "learning_rate": args.learning_rate,
                 "weight_decay": args.weight_decay,
                 "num_epochs": args.num_epochs,
+                "warmup_steps": args.warmup_steps,
+                "max_grad_norm": args.max_grad_norm,
                 "seed": args.seed,
             }
         }
@@ -308,23 +362,41 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
+        betas=(0.9, 0.95),
         weight_decay=args.weight_decay
+    )
+    
+    # Calculate total training steps for scheduler
+    num_training_steps = len(train_loader) * args.num_epochs
+    print(f"Total training steps: {num_training_steps}")
+    print(f"Warmup steps: {args.warmup_steps}")
+    
+    # Learning rate scheduler: warmup + cosine decay
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=num_training_steps
     )
     
     # Training loop
     print("Starting training...")
+    global_step = 0
     for epoch in range(args.num_epochs):
         print(f"\nEpoch {epoch+1}/{args.num_epochs}")
         
         # Train
-        train_loss, train_perplexity = train_epoch(
-            model, train_loader, criterion, optimizer, device, vocab_size, args.log_interval
+        train_loss, train_perplexity, global_step = train_epoch(
+            model, train_loader, criterion, optimizer, scheduler, device, vocab_size, global_step, args.max_grad_norm, args.log_interval
         )
         print(f"Train Loss: {train_loss:.4f}, Train Perplexity: {train_perplexity:.2f}")
         
         # Validate
         val_loss, val_perplexity = validate(model, val_loader, criterion, device, vocab_size)
         print(f"Val Loss: {val_loss:.4f}, Val Perplexity: {val_perplexity:.2f}")
+        
+        # Calculate metrics for logging
+        weight_norm = get_weight_norm(model)
+        current_lr = optimizer.param_groups[0]['lr']
         
         # Log to wandb
         if wandb.run is not None:
@@ -334,6 +406,9 @@ def main():
                 "train/perplexity": train_perplexity,
                 "val/loss": val_loss,
                 "val/perplexity": val_perplexity,
+                "train/weight_norm": weight_norm,
+                "train/learning_rate": current_lr,
+                "global_step": global_step
             })
     
     print("\nTraining completed!")
