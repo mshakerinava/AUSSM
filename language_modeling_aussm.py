@@ -9,6 +9,8 @@ import os
 import argparse
 import math
 import wandb
+import random
+import numpy as np
 from pathlib import Path
 
 # Add path for imports
@@ -163,6 +165,116 @@ def validate(model, val_loader, criterion, device, vocab_size):
     return avg_val_loss, avg_val_perplexity
 
 
+def save_checkpoint(checkpoint_dir, model, optimizer, scheduler, epoch, global_step, args, best_val_loss=None):
+    """Save training checkpoint."""
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save latest checkpoint
+    checkpoint_path = checkpoint_dir / "checkpoint_latest.pt"
+    
+    # Get random states
+    random_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    if torch.cuda.is_available():
+        torch_cuda_states = [torch.cuda.get_rng_state(i) for i in range(torch.cuda.device_count())]
+    else:
+        torch_cuda_states = None
+    
+    checkpoint = {
+        'epoch': epoch,
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+        'random_state': random_state,
+        'numpy_state': numpy_state,
+        'torch_state': torch_state,
+        'torch_cuda_states': torch_cuda_states,
+        'args': vars(args),
+        'best_val_loss': best_val_loss,
+    }
+    
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
+    
+    # Also save epoch-specific checkpoint
+    epoch_checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pt"
+    torch.save(checkpoint, epoch_checkpoint_path)
+    
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, device):
+    """Load training checkpoint."""
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Load scheduler state
+    if scheduler is not None and checkpoint.get('scheduler_state_dict') is not None:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    # Restore random states
+    if 'random_state' in checkpoint:
+        random.setstate(checkpoint['random_state'])
+    if 'numpy_state' in checkpoint:
+        np.random.set_state(checkpoint['numpy_state'])
+    if 'torch_state' in checkpoint:
+        torch.set_rng_state(checkpoint['torch_state'])
+    if 'torch_cuda_states' in checkpoint and checkpoint['torch_cuda_states'] is not None:
+        if torch.cuda.is_available():
+            for i, state in enumerate(checkpoint['torch_cuda_states']):
+                if i < torch.cuda.device_count():
+                    torch.cuda.set_rng_state(state, i)
+    
+    saved_epoch = checkpoint.get('epoch', 0)  # This is 1-indexed (epoch number we just completed)
+    global_step = checkpoint.get('global_step', 0)
+    best_val_loss = checkpoint.get('best_val_loss', None)
+    
+    # Epoch in checkpoint is 1-indexed (epoch number we just completed)
+    # If we saved epoch=3 (1-indexed), we completed epoch 2 (0-indexed), so start from epoch 3 (0-indexed)
+    # But we want to continue from the NEXT epoch, not repeat the one we just completed
+    # So if saved_epoch=3 (1-indexed, meaning we completed epoch 2), we start from epoch 3 (0-indexed)
+    # This means we use saved_epoch as the 0-indexed start epoch
+    start_epoch_0_indexed = saved_epoch
+    
+    print(f"Resumed from checkpoint at epoch {saved_epoch} (1-indexed, completed epoch {saved_epoch-1} 0-indexed)")
+    print(f"Will continue training from epoch {start_epoch_0_indexed} (0-indexed), global_step {global_step}")
+    if best_val_loss is not None:
+        print(f"Best validation loss: {best_val_loss:.4f}")
+    
+    return start_epoch_0_indexed, global_step, best_val_loss
+
+
+def find_latest_checkpoint(checkpoint_dir):
+    """Find the latest checkpoint in the checkpoint directory."""
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        return None
+    
+    latest_checkpoint = checkpoint_dir / "checkpoint_latest.pt"
+    if latest_checkpoint.exists():
+        return latest_checkpoint
+    
+    # Fallback: find the highest epoch checkpoint
+    epoch_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pt"))
+    if epoch_checkpoints:
+        return epoch_checkpoints[-1]
+    
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train AUSSM/Mamba language model on WikiText-2')
     
@@ -219,6 +331,16 @@ def main():
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     
+    # Checkpoint arguments
+    parser.add_argument('--checkpoint_dir', type=str, default=None,
+                       help='Directory to save checkpoints (default: $SCRATCH/AUSSM/checkpoints/<run_name> or ./checkpoints/<run_name>)')
+    parser.add_argument('--resume_from', type=str, default=None,
+                       help='Path to checkpoint file to resume from (overrides auto-resume)')
+    parser.add_argument('--checkpoint_interval', type=int, default=1,
+                       help='Save checkpoint every N epochs (default: 1, saves after each epoch)')
+    parser.add_argument('--no_auto_resume', action='store_true',
+                       help='Disable automatic resume from latest checkpoint')
+    
     args = parser.parse_args()
     
     # Set device
@@ -227,15 +349,52 @@ def main():
     else:
         device = args.device
     
-    # Set random seed
+    # Set random seed (will be overridden if resuming from checkpoint)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     
     # Count layers
     num_aussm, num_mamba, total_layers = count_layers(args.layers)
     
-    # Initialize wandb
+    # Determine checkpoint directory
+    if args.checkpoint_dir is None:
+        # Default to SCRATCH if available, otherwise current directory
+        scratch_dir = os.environ.get('SCRATCH', None)
+        if scratch_dir:
+            checkpoint_base = Path(scratch_dir) / "AUSSM" / "checkpoints"
+        else:
+            checkpoint_base = Path("checkpoints")
+        
+        # Use wandb run name for checkpoint subdirectory
+        run_name = args.wandb_run_name
+        if run_name is None:
+            run_name = f"layers_{args.layers}_d{args.d_model}_s{args.d_state}_lr{args.learning_rate}"
+        
+        checkpoint_dir = checkpoint_base / run_name
+    else:
+        checkpoint_dir = Path(args.checkpoint_dir)
+    
+    # Check for existing checkpoint to resume from
+    resume_from_checkpoint = None
+    start_epoch = 0
+    start_global_step = 0
+    best_val_loss = None
+    
+    if args.resume_from:
+        # Explicit checkpoint path provided
+        resume_from_checkpoint = Path(args.resume_from)
+        if not resume_from_checkpoint.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {resume_from_checkpoint}")
+    elif not args.no_auto_resume:
+        # Auto-resume: look for latest checkpoint
+        resume_from_checkpoint = find_latest_checkpoint(checkpoint_dir)
+        if resume_from_checkpoint:
+            print(f"Found existing checkpoint: {resume_from_checkpoint}")
+    
+    # Initialize wandb (before loading checkpoint to potentially resume run)
     if not args.no_wandb:
         run_name = args.wandb_run_name
         if run_name is None:
@@ -261,12 +420,20 @@ def main():
                 "warmup_steps": args.warmup_steps,
                 "max_grad_norm": args.max_grad_norm,
                 "seed": args.seed,
+                "checkpoint_dir": str(checkpoint_dir),
             }
         }
         if args.wandb_entity:
             wandb_kwargs['entity'] = args.wandb_entity
         if args.wandb_group:
             wandb_kwargs['group'] = args.wandb_group
+        
+        # If resuming, try to resume the wandb run
+        if resume_from_checkpoint:
+            # Try to find wandb run ID from checkpoint directory name or metadata
+            # For now, we'll just create a new run but log that we're resuming
+            wandb_kwargs['resume'] = 'allow'  # Allow resuming if run exists
+            wandb_kwargs['config']['resumed'] = True
         
         wandb.init(**wandb_kwargs)
     
@@ -378,10 +545,23 @@ def main():
         num_training_steps=num_training_steps
     )
     
+    # Load checkpoint if resuming
+    if resume_from_checkpoint:
+        start_epoch, start_global_step, best_val_loss = load_checkpoint(
+            resume_from_checkpoint, model, optimizer, scheduler, device
+        )
+        # Adjust epoch range to continue from where we left off
+        print(f"Resuming training from epoch {start_epoch + 1}/{args.num_epochs}")
+        if wandb.run is not None:
+            wandb.log({"resumed": True, "resume_epoch": start_epoch, "resume_step": start_global_step})
+    else:
+        print(f"Starting training from scratch")
+        print(f"Checkpoints will be saved to: {checkpoint_dir}")
+    
     # Training loop
     print("Starting training...")
-    global_step = 0
-    for epoch in range(args.num_epochs):
+    global_step = start_global_step
+    for epoch in range(start_epoch, args.num_epochs):
         print(f"\nEpoch {epoch+1}/{args.num_epochs}")
         
         # Train
@@ -410,8 +590,27 @@ def main():
                 "train/learning_rate": current_lr,
                 "global_step": global_step
             })
+        
+        # Update best validation loss
+        if best_val_loss is None or val_loss < best_val_loss:
+            best_val_loss = val_loss
+        
+        # Save checkpoint periodically
+        if (epoch + 1) % args.checkpoint_interval == 0 or (epoch + 1) == args.num_epochs:
+            save_checkpoint(
+                checkpoint_dir, model, optimizer, scheduler, epoch + 1, global_step, args, best_val_loss
+            )
+            if wandb.run is not None:
+                # Log checkpoint path to wandb
+                wandb.log({"checkpoint_saved": True, "checkpoint_epoch": epoch + 1})
     
     print("\nTraining completed!")
+    
+    # Save final checkpoint
+    save_checkpoint(
+        checkpoint_dir, model, optimizer, scheduler, args.num_epochs, global_step, args, best_val_loss
+    )
+    
     if wandb.run is not None:
         wandb.finish()
 
